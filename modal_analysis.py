@@ -3,13 +3,16 @@
 '''
 import argparse
 import numpy as np
-import scipy
+from scipy.sparse import coo_matrix, csr_matrix
+from scipy.sparse.linalg import eigs
 
 class Mesh:
-  nodes = np.empty((0, 3), dtype=np.double)
-  tets = np.empty((0, 4), dtype=np.int32)
-  num_nodes = 0
-  num_tets = 0
+
+  def __init__(self):
+    self.nodes = np.empty((0, 3), dtype=np.double)
+    self.tets = np.empty((0, 4), dtype=np.int32)
+    self.num_nodes = 0
+    self.num_tets = 0
 
   def load_from_vtk(self, filename):
     '''Read mesh from a vtk file.'''
@@ -56,21 +59,156 @@ class Mesh:
     self.nodes = np.asarray(nodes_list)
     self.tets = np.asarray(tets_list)
     print('Successfully read: ' + filename)
-    print('#nodes: {self.nodes}')
-    print('#tets: {self.tets}')
+    print(f'#nodes: {self.num_nodes}')
+    print(f'#tets: {self.num_tets}')
 
   def load_from_obj(self, filename):
     '''Read mesh from an obj file.'''
     print('called obj: ' + filename)
 
-
-'''Modal analysis driver class
-
-'''
+'''Modal analyzer'''
 class ModalAnalyzer:
+  _stiffness_matrix: csr_matrix
+  _mass_matrix: csr_matrix
 
-  _num_modes = 0
-  _mesh = Mesh()
+  def __init__(self, mesh):
+    self._mesh = mesh
+    self._youngs_modulus = 1.0
+    self._rho = 1000.0
+    self._area = 1.0e-4
+
+  def _get_index(self, node_1, node_2):
+    '''The the unique index of the edge.'''
+    cantor_pair = lambda i, j: (i + j) * (i + j + 1) / 2 + j
+    return cantor_pair(node_1, node_2) if node_1 > node_2 else cantor_pair(node_2, node_1)
+
+  def _build_mass_spring_model(self):
+    '''Internal method to build matrices for the mass-spring model.'''
+
+    node_order = np.array([[0, 1], [1, 2], [2, 0], [3, 0], [3, 1], [3, 2]], dtype=int)
+    edge_lookup_table = {}
+
+    for i_tet in range(self._mesh.num_tets):
+      for i in range(6):
+        node_1 = self._mesh.tets[i_tet, node_order[i, 0]]
+        node_2 = self._mesh.tets[i_tet, node_order[i, 1]]
+        edge_index = self._get_index(node_1, node_2)
+
+        if edge_index not in edge_lookup_table:
+          edge_lookup_table[edge_index] = [node_1, node_2]
+
+    # auxiliary list for building the sparse matrix
+    i_list = []
+    j_list = []
+    k_value_list = []
+    m_value_list = []
+
+    for edge in edge_lookup_table.values():
+      # global node index
+      node_1 = edge[0]
+      node_2 = edge[1]
+      # nodal coordinates
+      x_1 = self._mesh.nodes[node_1, :]
+      x_2 = self._mesh.nodes[node_2, :]
+
+      # transformation matrix
+      length = np.linalg.norm(x_1 - x_2, ord=2)
+      c_x = (x_1[0] - x_2[0]) / length
+      c_y = (x_1[1] - x_2[1]) / length
+      c_z = (x_1[2] - x_2[2]) / length
+      t_matrix = np.array([[c_x, c_y, c_z, 0, 0, 0],
+                           [0, 0, 0, c_x, c_y, c_z]])
+
+      # local stiffness matrix
+      k_s = self._youngs_modulus * self._area / length
+      k_local = t_matrix.transpose() @ np.array([[k_s, -k_s], [-k_s, k_s]]) @ t_matrix
+
+      # local mass matrix
+      m_local = np.identity(6, dtype=float) * self._rho * self._area * length
+
+      # build global matrix
+      entry_1 = 3 * node_1
+      entry_2 = 3 * node_2
+
+      for i in range(3):
+        for j in range(3):
+          # block [0:2, 0:2]
+          i_list.append(entry_1 + i)
+          j_list.append(entry_1 + j)
+          k_value_list.append(k_local[i, j])
+          m_value_list.append(m_local[i, j])
+
+          # block [3:5, 0:2]
+          i_list.append(entry_2 + i)
+          j_list.append(entry_1 + j)
+          k_value_list.append(k_local[i+3, j])
+          m_value_list.append(m_local[i+3, j])
+
+          # block [0:2, 3:5]
+          i_list.append(entry_1 + i)
+          j_list.append(entry_2 + j)
+          k_value_list.append(k_local[i, j+3])
+          m_value_list.append(m_local[i, j+3])
+
+          # block [3:5, 3:5]
+          i_list.append(entry_2 + i)
+          j_list.append(entry_2 + j)
+          k_value_list.append(k_local[i+3, j+3])
+          m_value_list.append(m_local[i+3, j+3])
+
+    # build triplets
+    global_matrix_size = self._mesh.num_nodes * 3
+    buffer_stiffness_matrix = coo_matrix((k_value_list, (i_list, j_list)),
+                                          shape=(global_matrix_size, global_matrix_size))
+    buffer_mass_matrix = coo_matrix((m_value_list, (i_list, j_list)),
+                                     shape=(global_matrix_size, global_matrix_size))
+
+    # converge to CSR matrix
+    self._stiffness_matrix = buffer_stiffness_matrix.tocsr()
+    self._mass_matrix = buffer_mass_matrix.tocsr()
+
+    print(self._stiffness_matrix - self._stiffness_matrix.transpose())
+    print('Mass-spring model building complete')
+
+
+  def _build_linear_fem_model(self):
+    '''Internal method to build matrices for the linearelastic FEM model.'''
+
+    print('Linearelastic FEM model building complete')
+
+
+  def build_matrice(self, cons_model):
+    '''Build full-space matrices stiffness and mass matrices for the given mesh.'''
+
+    if cons_model == 0:
+      self._build_mass_spring_model()
+
+    elif cons_model == 1:
+      self._build_linear_fem_model()
+
+    else:
+      raise RuntimeError('Invalid cons_model arguments.')
+
+  def eigen_solve(self, num_modes):
+    '''Solve the generalized eigenvalue problems.'''
+
+    eigenvalues, eigenvectors = eigs(self._mass_matrix, M=self._mass_matrix,
+                                     k=10, which='SM',
+                                     maxiter = 1000, tol=0)
+    print(eigenvalues)
+    # print(eigenvectors)
+
+  def compute_reduced_matrices(self):
+    '''Compute the reduced mass and stiffness matrices'''
+
+
+
+'''Modal analysis driver class'''
+class AnalysisDriver:
+
+  def __init__(self):
+    self._mesh = Mesh()
+    self._analyzer = ModalAnalyzer(self._mesh)
 
   def load_mesh(self, filename):
     '''Load mesh infomation from .vtk or .obj files for modal analysis. '''
@@ -87,14 +225,34 @@ class ModalAnalyzer:
       raise RuntimeError('Unsupported file type: ' + file_extension +
                          '. Please check your input arguments.')
 
-  def analyze(self):
-    pass
+  def analyze(self, cons_model, num_modes):
+    '''Run modal analysis for the given mesh.
 
-  def write_reduced_modes(self):
-    pass
+    Args:
+        cons_model: option for constitutive model.
+                    0 is mass-spring, and 1 is linearelastic FEM.
+        num_modes: the number of modes needs to be computed
+    '''
+    # build full space matrices K and M
+    self._analyzer.build_matrice(cons_model)
+    # solve the generalize eigenvalue problem
+    self._analyzer.eigen_solve(num_modes)
+    # compute the reduced mass and stiffness matrices
+    self._analyzer.compute_reduced_matrices()
 
-  def debug_reduced_mode_shape(self):
-    pass
+  def write_reduced_modes(self, output_dir):
+    '''Write the reduced deformable files.
+
+    This function writes the reduced stiffness matrix, nodal mass array,
+    modes and eigenvalues to files. All output files are .bin files.
+
+    Args:
+        output_dir: directory to save all the output files
+    '''
+    # TODO
+
+  def debug_reduced_mode_shape(self, mode, output_dir):
+    '''Output the deformed mode shape for the given mode'''
 
 
 def main():
@@ -104,14 +262,21 @@ def main():
                         help='name of the input mesh', required=True)
     parser.add_argument('--output_dir', action='store', type=str, default='',
                         help='output directory of reduced deformable files')
+    parser.add_argument('--num_modes', action='store', type=int, default=1,
+                        help='Number of modes to compute')
+    parser.add_argument('--cons_model', action='store', type=int, default=0,
+                        help='Constitutive model: 0 is mass-spring, 1 is linear FEM')
     parser.add_argument('--debug_mode', action='store', type=int, default=-1,
                         help='check the mode shape of the given mode')
     parser.add_argument('--verbose', action='store_true', default=False,
                         help='Verbose profiling')
     args = parser.parse_args()
 
-    analyzer = ModalAnalyzer()
-    analyzer.load_mesh(args.input_mesh)
+    driver = AnalysisDriver()
+    # load mesh from file
+    driver.load_mesh(args.input_mesh)
+    # run modal analysis
+    driver.analyze(args.cons_model, args.num_modes)
 
   except RuntimeError as err:
     print(err.args[0])
