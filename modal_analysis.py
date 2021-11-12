@@ -3,8 +3,8 @@
 '''
 import argparse
 import numpy as np
-from scipy.sparse import coo_matrix, csr_matrix
-from scipy.sparse.linalg import eigs
+from scipy.sparse import dok_matrix, csr_matrix
+from scipy.sparse.linalg import eigsh
 
 class Mesh:
 
@@ -58,9 +58,6 @@ class Mesh:
 
     self.nodes = np.asarray(nodes_list)
     self.tets = np.asarray(tets_list)
-    print('Successfully read: ' + filename)
-    print(f'#nodes: {self.num_nodes}')
-    print(f'#tets: {self.num_tets}')
 
   def load_from_obj(self, filename):
     '''Read mesh from an obj file.'''
@@ -73,17 +70,18 @@ class ModalAnalyzer:
 
   def __init__(self, mesh):
     self._mesh = mesh
-    self._youngs_modulus = 1.0
-    self._rho = 1000.0
+    self._youngs_modulus = 1.0e5
+    self._rho = 1.0e3
     self._area = 1.0e-4
 
   def _get_index(self, node_1, node_2):
-    '''The the unique index of the edge.'''
-    cantor_pair = lambda i, j: (i + j) * (i + j + 1) / 2 + j
+    '''Get the unique index of the edge.'''
+    cantor_pair = lambda i, j: int((i + j) * (i + j + 1) / 2 + j)
     return cantor_pair(node_1, node_2) if node_1 > node_2 else cantor_pair(node_2, node_1)
 
   def _build_mass_spring_model(self):
     '''Internal method to build matrices for the mass-spring model.'''
+    print('Building mass-spring model...')
 
     node_order = np.array([[0, 1], [1, 2], [2, 0], [3, 0], [3, 1], [3, 2]], dtype=int)
     edge_lookup_table = {}
@@ -97,11 +95,10 @@ class ModalAnalyzer:
         if edge_index not in edge_lookup_table:
           edge_lookup_table[edge_index] = [node_1, node_2]
 
-    # auxiliary list for building the sparse matrix
-    i_list = []
-    j_list = []
-    k_value_list = []
-    m_value_list = []
+    # auxiliary matrices for building the sparse matrix
+    global_matrix_size = self._mesh.num_nodes * 3
+    k_buffer = dok_matrix((global_matrix_size, global_matrix_size), dtype=np.double)
+    m_buffer = dok_matrix((global_matrix_size, global_matrix_size), dtype=np.double)
 
     for edge in edge_lookup_table.values():
       # global node index
@@ -124,55 +121,37 @@ class ModalAnalyzer:
       k_local = t_matrix.transpose() @ np.array([[k_s, -k_s], [-k_s, k_s]]) @ t_matrix
 
       # local mass matrix
-      m_local = np.identity(6, dtype=float) * self._rho * self._area * length
+      m_local = np.identity(6, dtype=float) * self._rho * self._area * length * 0.5
 
       # build global matrix
       entry_1 = 3 * node_1
       entry_2 = 3 * node_2
 
-      for i in range(3):
-        for j in range(3):
-          # block [0:2, 0:2]
-          i_list.append(entry_1 + i)
-          j_list.append(entry_1 + j)
-          k_value_list.append(k_local[i, j])
-          m_value_list.append(m_local[i, j])
+      k_buffer[entry_1:entry_1+3, entry_1:entry_1+3] += k_local[:3, :3]
+      k_buffer[entry_1:entry_1+3, entry_2:entry_2+3] += k_local[:3, 3:]
+      k_buffer[entry_2:entry_2+3, entry_1:entry_1+3] += k_local[3:, :3]
+      k_buffer[entry_2:entry_2+3, entry_2:entry_2+3] += k_local[3:, 3:]
 
-          # block [3:5, 0:2]
-          i_list.append(entry_2 + i)
-          j_list.append(entry_1 + j)
-          k_value_list.append(k_local[i+3, j])
-          m_value_list.append(m_local[i+3, j])
-
-          # block [0:2, 3:5]
-          i_list.append(entry_1 + i)
-          j_list.append(entry_2 + j)
-          k_value_list.append(k_local[i, j+3])
-          m_value_list.append(m_local[i, j+3])
-
-          # block [3:5, 3:5]
-          i_list.append(entry_2 + i)
-          j_list.append(entry_2 + j)
-          k_value_list.append(k_local[i+3, j+3])
-          m_value_list.append(m_local[i+3, j+3])
-
-    # build triplets
-    global_matrix_size = self._mesh.num_nodes * 3
-    buffer_stiffness_matrix = coo_matrix((k_value_list, (i_list, j_list)),
-                                          shape=(global_matrix_size, global_matrix_size))
-    buffer_mass_matrix = coo_matrix((m_value_list, (i_list, j_list)),
-                                     shape=(global_matrix_size, global_matrix_size))
+      m_buffer[entry_1:entry_1+3, entry_1:entry_1+3] += m_local[:3, :3]
+      m_buffer[entry_1:entry_1+3, entry_2:entry_2+3] += m_local[:3, 3:]
+      m_buffer[entry_2:entry_2+3, entry_1:entry_1+3] += m_local[3:, :3]
+      m_buffer[entry_2:entry_2+3, entry_2:entry_2+3] += m_local[3:, 3:]
 
     # converge to CSR matrix
-    self._stiffness_matrix = buffer_stiffness_matrix.tocsr()
-    self._mass_matrix = buffer_mass_matrix.tocsr()
+    self._stiffness_matrix = k_buffer.tocsr()
+    self._mass_matrix = m_buffer.tocsr()
 
-    print(self._stiffness_matrix - self._stiffness_matrix.transpose())
+    # enforce symmetry
+    self._stiffness_matrix = 0.5 * (self._stiffness_matrix + self._stiffness_matrix.transpose())
+
+    np.savetxt('stiffness.txt', k_buffer.todense(), fmt='%.16e')
+    np.savetxt('mass.txt', m_buffer.todense(), fmt='%.16e')
     print('Mass-spring model building complete')
 
 
   def _build_linear_fem_model(self):
     '''Internal method to build matrices for the linearelastic FEM model.'''
+    print('Building Linearelastic FEM model...')
 
     print('Linearelastic FEM model building complete')
 
@@ -192,10 +171,12 @@ class ModalAnalyzer:
   def eigen_solve(self, num_modes):
     '''Solve the generalized eigenvalue problems.'''
 
-    eigenvalues, eigenvectors = eigs(self._mass_matrix, M=self._mass_matrix,
-                                     k=10, which='SM',
-                                     maxiter = 1000, tol=0)
-    print(eigenvalues)
+    num_modes = num_modes if num_modes > 0 else self._mesh.num_nodes * 3
+    eigenvalues, eigenvectors = eigsh(self._stiffness_matrix, M=self._mass_matrix,
+                                      k=num_modes, which='SM')
+                                      # maxiter = 1000, tol=0)
+    print('First 10 eigenvalues:')
+    print(eigenvalues[:10])
     # print(eigenvectors)
 
   def compute_reduced_matrices(self):
@@ -212,7 +193,8 @@ class AnalysisDriver:
 
   def load_mesh(self, filename):
     '''Load mesh infomation from .vtk or .obj files for modal analysis. '''
-    print('filename: ' + filename)
+
+    print('\nLoading: ' + filename)
 
     file_extension = filename.split('.')[-1]
     if file_extension == 'obj':
@@ -224,6 +206,10 @@ class AnalysisDriver:
     else:
       raise RuntimeError('Unsupported file type: ' + file_extension +
                          '. Please check your input arguments.')
+
+    print('Successfully read: ' + filename)
+    print(f'#nodes: {self._mesh.num_nodes}')
+    print(f'#tets: {self._mesh.num_tets}\n')
 
   def analyze(self, cons_model, num_modes):
     '''Run modal analysis for the given mesh.
@@ -262,7 +248,7 @@ def main():
                         help='name of the input mesh', required=True)
     parser.add_argument('--output_dir', action='store', type=str, default='',
                         help='output directory of reduced deformable files')
-    parser.add_argument('--num_modes', action='store', type=int, default=1,
+    parser.add_argument('--num_modes', action='store', type=int, default=-1,
                         help='Number of modes to compute')
     parser.add_argument('--cons_model', action='store', type=int, default=0,
                         help='Constitutive model: 0 is mass-spring, 1 is linear FEM')
