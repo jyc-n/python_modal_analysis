@@ -109,9 +109,11 @@ class ModalAnalyzer:
     self._rho = 1.0e3
     self._area = 1.0e-4
     self._full_size = 0
+    self._num_rigid_modes = 0
 
     self.k_reduced: np.ndarray
     self.m_reduced: np.ndarray
+    self.eigenvalues : np.ndarray
     self.modes: np.ndarray
 
 
@@ -185,15 +187,13 @@ class ModalAnalyzer:
     # enforce symmetry
     self._stiffness_matrix = 0.5 * (self._stiffness_matrix + self._stiffness_matrix.transpose())
 
-    np.savetxt('stiffness.txt', k_buffer.todense(), fmt='%.16e')
-    np.savetxt('mass.txt', m_buffer.todense(), fmt='%.16e')
     print('Mass-spring model building complete\n')
 
 
   def _build_linear_fem_model(self):
     '''Internal method to build matrices for the linearelastic FEM model.'''
     print('Building Linearelastic FEM model...')
-
+    # TODO
     print('Linearelastic FEM model building complete\n')
 
 
@@ -214,6 +214,10 @@ class ModalAnalyzer:
 
   def eigen_solve(self, num_modes):
     '''Solve the generalized eigenvalue problems.'''
+
+    # Since the first few (up to 6) are the rigid motion modes, we intentially request 6 mores
+    # modes. At the end, we will count the number of rigid modes and disgard them.
+    num_modes += 6
 
     if num_modes > self._full_size:
       # Clamp the #modes to be equal full size.
@@ -239,12 +243,18 @@ class ModalAnalyzer:
                                     k=num_modes,
                                     which='SM')
                                     # maxiter = 1000, tol=0)
+
+    self.eigenvalues = eigenvalues
     self.modes = eigenvectors
-    print('Solving complete!\nFirst 10 eigenvalues are:')
-    print(eigenvalues[:10])
+
+    # get the number of rigid modes
+    print('Solving complete!\nFirst 10 eigenvalues before the clean up are:')
+    first_ten_eigenvalues = eigenvalues[:10]
+    print(first_ten_eigenvalues)
+    self._num_rigid_modes = first_ten_eigenvalues[first_ten_eigenvalues < 1e-12].size
 
 
-  def compute_reduced_matrices(self):
+  def compute_reduced_matrices(self, num_modes):
     '''Compute the reduced mass and stiffness matrices
 
     The reduced stiffness matrix and the reduced mass matrix is computed here. By virtue of the
@@ -255,6 +265,14 @@ class ModalAnalyzer:
 
     self.k_reduced = np.diag(self.modes.transpose() @ self._stiffness_matrix @ self.modes)
     self.m_reduced = np.diag(self.modes.transpose() @ self._mass_matrix @ self.modes)
+
+    # remove the rigid modes eigenvalues and eigenvectors
+    self.eigenvalues = self.eigenvalues[self._num_rigid_modes:self._num_rigid_modes+num_modes]
+    self.modes = self.modes[:, self._num_rigid_modes:self._num_rigid_modes+num_modes]
+
+    # only save non-rigid reduced mass and stiffness matrices
+    self.k_reduced = self.k_reduced[self._num_rigid_modes:self._num_rigid_modes+num_modes]
+    self.m_reduced = self.m_reduced[self._num_rigid_modes:self._num_rigid_modes+num_modes]
 
 
 '''Modal analysis driver class'''
@@ -299,7 +317,7 @@ class AnalysisDriver:
     # solve the generalize eigenvalue problem
     self._analyzer.eigen_solve(num_modes)
     # compute the reduced mass and stiffness matrices
-    self._analyzer.compute_reduced_matrices()
+    self._analyzer.compute_reduced_matrices(num_modes)
 
 
   def _write_binary(self, filename, data, size):
@@ -322,8 +340,17 @@ class AnalysisDriver:
     modes and eigenvalues to files. All output files are .bin files.
     '''
     # write eigenvalues
+    self._write_binary('eigenvalues.bin',
+                       np.ascontiguousarray(self._analyzer.eigenvalues),
+                       self._analyzer.eigenvalues)
 
+    # flatten the 2D array (ndofs x num_modes) of modes to a 1D array
+    flat_mode = self._analyzer.modes.flatten()
+    total_size = flat_mode.size
     # write modes
+    self._write_binary('modes.bin',
+                       np.ascontiguousarray(flat_mode),
+                       total_size)
 
     # write reduced stiffness matrix
     self._write_binary('K_r_diag_mat.bin',
@@ -347,7 +374,7 @@ class AnalysisDriver:
 
     # get the deformed shape
     deformed_node = self._mesh.nodes
-    delta_nodes = np.reshape(self._analyzer.modes[:, mode], (self._mesh.num_nodes, 3))
+    delta_nodes = np.reshape(self._analyzer.modes[:, mode-1], (self._mesh.num_nodes, 3))
     deformed_node += delta_nodes
 
     # write deformed mesh
