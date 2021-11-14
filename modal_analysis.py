@@ -3,6 +3,7 @@
 '''
 import argparse
 import numpy as np
+from numpy.core.fromnumeric import diagonal
 import scipy.linalg
 from scipy.sparse import dok_matrix, csr_matrix
 from scipy.sparse.linalg import eigsh
@@ -105,7 +106,7 @@ class ModalAnalyzer:
 
   def __init__(self, mesh):
     self._mesh = mesh
-    self._youngs_modulus = 1.0e5
+    self._youngs_modulus = 1.0e4
     self._rho = 1.0e3
     self._area = 1.0e-4
     self._full_size = 0
@@ -211,6 +212,13 @@ class ModalAnalyzer:
     else:
       raise RuntimeError('Invalid cons_model arguments.')
 
+  def get_nodal_mass(self):
+    '''Get the diagonal nodal mass matrix'''
+
+    diagonal_mass = np.diag(self._mass_matrix.toarray())
+    diagonal_mass = np.reshape(diagonal_mass, (self._mesh.num_nodes, 3))
+    return diagonal_mass[:, 0]
+
 
   def eigen_solve(self, num_modes):
     '''Solve the generalized eigenvalue problems.'''
@@ -228,6 +236,7 @@ class ModalAnalyzer:
       # -1 means computing all the modes
       num_modes = self._full_size
 
+    print('Solving eigenvalue problems...')
     if num_modes == self._full_size:
       # Run the dense eigenvalue problem solver if full modes are requested.
       print('[Warning] using the dense eigenvalue solver. Expect slower computation...')
@@ -237,12 +246,13 @@ class ModalAnalyzer:
     else:
       # Run the sparse eigenvalue problem solver.
       # This should be more efficient than the dense solver.
+      print('Sparse eigenvalue solver [eigsh] is used.')
       eigenvalues, eigenvectors = eigsh(
                                     self._stiffness_matrix,
                                     M=self._mass_matrix,
                                     k=num_modes,
                                     which='SM')
-                                    # maxiter = 1000, tol=0)
+                                    # maxiter = 10000, tol=0)
 
     self.eigenvalues = eigenvalues
     self.modes = eigenvectors
@@ -251,7 +261,7 @@ class ModalAnalyzer:
     print('Solving complete!\nFirst 10 eigenvalues before the clean up are:')
     first_ten_eigenvalues = eigenvalues[:10]
     print(first_ten_eigenvalues)
-    self._num_rigid_modes = first_ten_eigenvalues[first_ten_eigenvalues < 1e-12].size
+    self._num_rigid_modes = first_ten_eigenvalues[first_ten_eigenvalues < 1e-6].size
 
 
   def compute_reduced_matrices(self, num_modes):
@@ -330,7 +340,7 @@ class AnalysisDriver:
     '''
     with open(filename, 'wb') as outfile:
       outfile.write(np.uint32(size))
-      outfile.write(np.double(data))
+      outfile.write(data.tobytes())
 
 
   def write_reduced_files(self):
@@ -341,27 +351,35 @@ class AnalysisDriver:
     '''
     # write eigenvalues
     self._write_binary('eigenvalues.bin',
-                       np.ascontiguousarray(self._analyzer.eigenvalues),
-                       self._analyzer.eigenvalues)
+                       np.ascontiguousarray(self._analyzer.eigenvalues, dtype=np.double),
+                       self._analyzer.eigenvalues.size)
 
     # flatten the 2D array (ndofs x num_modes) of modes to a 1D array
-    flat_mode = self._analyzer.modes.flatten()
+    # we need to use column-major order because each column is a mode
+    flat_mode = self._analyzer.modes.flatten('F')
     total_size = flat_mode.size
     # write modes
     self._write_binary('modes.bin',
-                       np.ascontiguousarray(flat_mode),
+                       np.ascontiguousarray(flat_mode, dtype=np.double),
                        total_size)
 
     # write reduced stiffness matrix
     self._write_binary('K_r_diag_mat.bin',
-                       np.ascontiguousarray(self._analyzer.k_reduced),
+                       np.ascontiguousarray(self._analyzer.k_reduced, dtype=np.double),
                        self._analyzer.k_reduced.size)
-    # write mass stiffness matrix
+
+    # write reduced mass matrix
     self._write_binary('M_r_diag_mat.bin',
-                       np.ascontiguousarray(self._analyzer.m_reduced),
+                       np.ascontiguousarray(self._analyzer.m_reduced, dtype=np.double),
                        self._analyzer.m_reduced.size)
 
-  def debug_reduced_mode_shape(self, mode):
+    # write nodal mass matrix
+    nodal_mass = self._analyzer.get_nodal_mass()
+    self._write_binary('M_diag_mat.bin',
+                       np.ascontiguousarray(nodal_mass, dtype=np.double),
+                       nodal_mass.size)
+
+  def debug_reduced_mode_shape(self, mode, outfile='frame_1.obj'):
     '''Output the deformed mode shape for the given mode.
 
     Write the undeformed shape and the deformed shape of the given mode as an .obj file. Two files
@@ -373,12 +391,12 @@ class AnalysisDriver:
     self._mesh.write_obj(self._mesh.nodes, 'frame_0.obj')
 
     # get the deformed shape
-    deformed_node = self._mesh.nodes
+    deformed_node = self._mesh.nodes.copy()
     delta_nodes = np.reshape(self._analyzer.modes[:, mode-1], (self._mesh.num_nodes, 3))
     deformed_node += delta_nodes
 
     # write deformed mesh
-    self._mesh.write_obj(deformed_node, 'frame_1.obj')
+    self._mesh.write_obj(deformed_node, outfile)
 
 def main():
   try:
@@ -389,7 +407,7 @@ def main():
                         help='Number of modes to compute')
     parser.add_argument('--cons_model', action='store', type=int, default=0,
                         help='Constitutive model: 0 is mass-spring, 1 is linear FEM')
-    parser.add_argument('--debug_mode', action='store', type=int, default=-1,
+    parser.add_argument('--debug_mode', action='store', type=int, default=0,
                         help='check the mode shape of the given mode')
     parser.add_argument('--verbose', action='store_true', default=False,
                         help='Verbose profiling')
@@ -406,6 +424,9 @@ def main():
     # write the shape
     if args.debug_mode > 0:
       driver.debug_reduced_mode_shape(args.debug_mode)
+    elif args.debug_mode == -1:
+      for i in range(args.num_modes):
+        driver.debug_reduced_mode_shape(i+1, f'frame_{i+1}.obj')
 
   except RuntimeError as err:
     print(err.args[0])
