@@ -13,6 +13,7 @@ class Mesh:
 
   def __init__(self):
     self.nodes = np.empty((0, 3), dtype=np.double)
+    self.nodes_original = np.empty((0, 3), dtype=np.double)
     self.tets = np.empty((0, 4), dtype=np.int32)
     self.num_nodes = 0
     self.num_tets = 0
@@ -60,6 +61,7 @@ class Mesh:
           reading_tets = aux_counter > 0
 
     self.nodes = np.asarray(nodes_list)
+    self.nodes_original = self.nodes.copy()
     self.tets = np.asarray(tets_list)
 
   def load_from_obj(self, filename):
@@ -383,6 +385,9 @@ class AnalysisDriver:
                        np.ascontiguousarray(self._analyzer.eigenvalues, dtype=np.double),
                        self._analyzer.eigenvalues.size)
 
+    # scale modes back to original dimensions
+    self._analyzer.modes /= float(self._scale_mesh)
+
     # flatten the 2D array (ndofs x num_modes) of modes to a 1D array
     # we need to use column-major order because each column is a mode
     flat_mode = self._analyzer.modes.flatten('F')
@@ -417,10 +422,10 @@ class AnalysisDriver:
     '''
 
     # write undeformed mesh
-    self._mesh.write_obj(self._mesh.nodes, 'frame_0.obj')
+    self._mesh.write_obj(self._mesh.nodes_original, 'frame_0.obj')
 
     # get the deformed shape
-    deformed_node = self._mesh.nodes.copy()
+    deformed_node = self._mesh.nodes_original.copy()
     delta_nodes = np.reshape(self._analyzer.modes[:, mode-1], (self._mesh.num_nodes, 3))
     deformed_node += delta_nodes
 
