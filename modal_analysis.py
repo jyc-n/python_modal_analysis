@@ -8,6 +8,7 @@ import scipy.linalg
 from scipy.sparse import dok_matrix, csr_matrix
 from scipy.sparse.linalg import eigsh
 
+'''Mesh class holds the vertices and connectivity info.'''
 class Mesh:
 
   def __init__(self):
@@ -99,14 +100,37 @@ class Mesh:
       outfile.write(f'# {counter:d} faces\n')
 
 
-'''Modal analyzer'''
+  def scale_mesh_to_solve(self, scale):
+    '''Scale the so that it's easier to solve the eigenvalue problem.
+
+    Args:
+        scale: user-specified scaling factor for the mesh.
+    '''
+
+    dim_before = [np.amax(self.nodes[:, 0]) - np.amin(self.nodes[:, 0]),
+                  np.amax(self.nodes[:, 1]) - np.amin(self.nodes[:, 1]),
+                  np.amax(self.nodes[:, 2]) - np.amin(self.nodes[:, 2])]
+
+    print(f'Dimensions before scaling: [{dim_before[0]}, {dim_before[1]}, {dim_before[2]}]')
+
+    self.nodes[:, 0] *= scale
+    self.nodes[:, 1] *= scale
+    self.nodes[:, 2] *= scale
+
+    dim_after = [np.amax(self.nodes[:, 0]) - np.amin(self.nodes[:, 0]),
+                 np.amax(self.nodes[:, 1]) - np.amin(self.nodes[:, 1]),
+                 np.amax(self.nodes[:, 2]) - np.amin(self.nodes[:, 2])]
+
+    print(f'Dimensions after scaling: [{dim_after[0]}, {dim_after[1]}, {dim_after[2]}]')
+
+
+'''Build the discretized model and solve the generalized eigenvalue problem.'''
 class ModalAnalyzer:
-  _stiffness_matrix: csr_matrix
-  _mass_matrix: csr_matrix
+
 
   def __init__(self, mesh):
     self._mesh = mesh
-    self._youngs_modulus = 1.0e4
+    self._youngs_modulus = 1.0e5
     self._rho = 1.0e3
     self._area = 1.0e-4
     self._full_size = 0
@@ -116,6 +140,8 @@ class ModalAnalyzer:
     self.m_reduced: np.ndarray
     self.eigenvalues : np.ndarray
     self.modes: np.ndarray
+    self._stiffness_matrix: csr_matrix
+    self._mass_matrix: csr_matrix
 
 
   def _get_index(self, node_1, node_2):
@@ -285,12 +311,13 @@ class ModalAnalyzer:
     self.m_reduced = self.m_reduced[self._num_rigid_modes:self._num_rigid_modes+num_modes]
 
 
-'''Modal analysis driver class'''
+'''Modal analysis driver class.'''
 class AnalysisDriver:
 
-  def __init__(self):
+  def __init__(self, scale):
     self._mesh = Mesh()
     self._analyzer = ModalAnalyzer(self._mesh)
+    self._scale_mesh = scale
 
 
   def load_mesh(self, filename):
@@ -312,6 +339,8 @@ class AnalysisDriver:
     print('Successfully read: ' + filename)
     print(f'#nodes: {self._mesh.num_nodes}')
     print(f'#tets: {self._mesh.num_tets}\n')
+
+    self._mesh.scale_mesh_to_solve(self._scale_mesh)
 
 
   def analyze(self, cons_model, num_modes):
@@ -409,11 +438,11 @@ def main():
                         help='Constitutive model: 0 is mass-spring, 1 is linear FEM')
     parser.add_argument('--debug_mode', action='store', type=int, default=0,
                         help='check the mode shape of the given mode')
-    parser.add_argument('--verbose', action='store_true', default=False,
-                        help='Verbose profiling')
+    parser.add_argument('--scale_mesh', action='store', type=float, default=1,
+                        help='scale the mesh when computing the mode shape')
     args = parser.parse_args()
 
-    driver = AnalysisDriver()
+    driver = AnalysisDriver(args.scale_mesh)
     # load mesh from file
     driver.load_mesh(args.input_mesh)
     # run modal analysis
